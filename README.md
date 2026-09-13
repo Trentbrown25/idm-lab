@@ -1,34 +1,67 @@
-# Red Hat IdM (FreeIPA) Two-Node Lab — AWS EC2
+# Red Hat IdM (FreeIPA) Multi-Node Lab — AWS EC2
 
 ## Overview
-A two-node Red Hat IdM/FreeIPA lab built on AWS EC2 to practice centralized
+A multi-node Red Hat IdM/FreeIPA lab built on AWS EC2 to practice centralized
 identity management ahead of a Cloud Infrastructure Support Engineer role.
-Covers server install, client enrollment, user/group management, Host-Based
-Access Control (HBAC), and centralized sudo policy.
+Covers server install, client enrollment (including a second client host),
+user/group management, tiered role-based access via HBAC and sudo, password
+policies, nested group inheritance, per-host access control, and multi-master
+replication.
 
 ## Architecture
-- **idm-server** — AlmaLinux OS 9.8, `t3.medium`, runs Directory Server (LDAP),
-  Kerberos KDC, Dogtag CA, and Apache (no integrated DNS — relies on `/etc/hosts`).
-- **idm-client** — AlmaLinux OS 9.8, `t3.micro`, enrolled against idm-server.
-- Same VPC, custom subnet, shared security group scoping internal IdM ports
-  (53, 88, 389, 464, 636, 443) to the security group itself, and admin ports
-  (22, 80, 443) to a single home IP.
+- **idm-server** (`t3.medium`, 10.0.2.87) — Directory Server (LDAP), Kerberos
+  KDC, Dogtag CA, Apache. No integrated DNS; relies on `/etc/hosts`.
+- **idm-replica** (`t3.medium`, 10.0.2.22) — full IdM server peer, promoted
+  from a client via `ipa-replica-install`. Syncs the entire directory with
+  idm-server (multi-master replication).
+- **idm-client** (`t3.micro`, 10.0.2.159) — enrolled client, general access.
+- **idm-client2** (`t3.micro`, 10.0.2.125) — enrolled client, restricted to
+  sysadmins only (per-host HBAC scoping).
+- Shared security group: internal IdM ports (53, 80, 88, 389, 464, 636, 443,
+  7389) scoped to the security group itself; admin ports (22, 80, 443) also
+  open to a single home IP for direct access.
 
-## Setup Steps
-1. Launch two EC2 instances (AlmaLinux 9, official AlmaLinux OS Foundation AMI)
-   in the same VPC/subnet.
-2. Set real hostnames (`hostnamectl set-hostname`) and populate `/etc/hosts`
-   on both boxes with each other's private IPs.
-3. Open required security group ports (see Architecture above).
-4. `dnf install -y ipa-server` → `ipa-server-install` on idm-server (no
-   integrated DNS).
-5. `dnf install -y ipa-client` → `ipa-client-install --domain=... --server=...`
-   on idm-client.
-6. Create users/groups: `ipa user-add`, `ipa group-add`, `ipa group-add-member`.
-7. HBAC: `ipa hbacrule-add`, scope by user group/host/service, `ipa hbactest`
-   to verify.
-8. Sudo: `ipa sudorule-add`, attach commands and RunAs user, verify with
-   `sudo -l` / a live sudo attempt.
+## Identity & Access Model
+| Group | Users | SSH access | Sudo access | Password policy |
+|---|---|---|---|---|
+| sysadmins | asmith | idm-client, idm-client2 | Full (`ALL` as root) | Stricter: 30-day max life, 12-char min, lockout after 3 failed attempts/60s |
+| helpdesk | bwhite | idm-client only | None (denied at HBAC layer) | Global default |
+| developers | jdoe, cgreen | idm-client only | Scoped (`systemctl`/`who` as root) | Global default (90-day, 8-char min) |
+| all-staff (nested: sysadmins + developers) | — | — | Shared baseline (`who` as root) via inheritance | — |
+
+## Setup Steps (Server)
+1. Launch EC2 instance (AlmaLinux OS Foundation AMI — requires a one-time
+   free Marketplace subscription), `t3.medium` minimum (see Troubleshooting).
+2. Set hostname, populate `/etc/hosts`, open required security group ports.
+3. `dnf install -y ipa-server` → `ipa-server-install` (no integrated DNS;
+   run inside `tmux` to survive SSH disconnects during the CA/KDC setup).
+
+## Setup Steps (Client)
+1. `dnf install -y ipa-client` → `ipa-client-install --domain=... --server=...`
+2. Verify with `id admin` from the client.
+
+## Setup Steps (Replica)
+1. Enroll the new host as a regular client first (steps above).
+2. `dnf install -y ipa-server` (same package as the original server).
+3. `ipa-replica-install` inside `tmux` — this promotes the client to a full
+   server peer and begins directory replication.
+4. Verify replication by creating a user on one server and confirming it
+   appears on the other (`ipa user-show <user>` after `kinit admin` on the
+   second server).
+
+## Access Control Patterns Practiced
+- **Per-group HBAC/sudo** — different groups, different SSH/sudo privileges.
+- **Password policies** — group-specific `ipa pwpolicy-add` overriding the
+  global default, with priority ordering.
+- **Account lockout** — triggered via repeated failed logins, diagnosed with
+  `ipa user-status` (not the vague SSH error), resolved with `ipa user-unlock`.
+- **Nested/indirect group membership** — a parent group (`all-staff`)
+  containing other groups; members inherit its rules without being added
+  directly. Verified with `ipa user-show <user> --all | grep -i member`.
+- **Per-host access control** — the same user pool, different rules per
+  target host, so one client can be more restricted than another.
+- **Multi-master replication** — two independent, synchronized directory
+  servers.
 
 ## Troubleshooting Log
 
@@ -36,22 +69,24 @@ Access Control (HBAC), and centralized sudo policy.
 |---|---|---|
 | `OptInRequired` on `run-instances` | AMI is an AWS Marketplace listing requiring one-time subscription | Subscribe via the Marketplace console link (free for official AlmaLinux OS Foundation AMI) |
 | `UnsupportedOperation` on `run-instances` | `t2.micro` not supported by this Marketplace AMI | Use `t3.micro`/`t3.small`/`t3.medium` instead |
-| `Unsupported` — instance type not available in AZ | Subnet was in `us-east-1e`, which doesn't support the requested instance type | Create a new subnet in a supported AZ (`us-east-1a`), associate it with the route table that has the internet gateway route, enable auto-assign public IP |
-| SSH `Permission denied (publickey...)` | Wrong or missing `.pem` file path in the `ssh -i` command | Locate the correct `.pem` file; always pass the full path |
+| `Unsupported` — instance type not available in AZ | Subnet was in an AZ that doesn't support the requested instance type | Create a subnet in a supported AZ, associate the route table with the internet gateway, enable auto-assign public IP |
 | `ipa-server-install`: "Less than the minimum 1.2GB RAM" | `t3.micro`/`t3.small` insufficient for Directory Server + KDC + CA | Resize to `t3.medium` before installing |
-| SSH connection drops mid-install (`client_loop: send disconnect`) | Sustained CPU load during cert/CA generation on a CPU-credit-limited instance can cause network hiccups; foreground install has no resilience to a dropped session | Run `ipa-server-install` inside `tmux` so the process survives disconnects; consider a burstable-credit check (`CPUCreditBalance` in CloudWatch) before heavy installs |
-| `AssertionError: Another instance named 'LAB-LOCAL' may already exist` | A crashed install left a partial Directory Server instance behind; `ipactl status` alone doesn't catch this | `dsctl -l` to find it, `dsctl <instance> remove --do-it` to clean it up before retrying |
-| Repeated partial-install debris across multiple failed attempts | Manual cleanup after a crash doesn't always fully reset state | When in doubt after 2+ failed installs, terminate and relaunch a fresh instance — faster and more reliable than chasing leftover state |
-| `ipa-client-install`: `Joining realm failed: JSON-RPC call failed: Timeout` | Port 443 was scoped to home IP only, not to the security group — client couldn't reach the server's API over HTTPS | Add a security group rule opening 443 `--source-group` (in addition to the home-IP rule for browser access) |
-| `su - jdoe` → `Permission denied` on a freshly reset/expired password | `su`'s PAM path doesn't always handle "password expired" prompts the way `sshd`'s does | Use `ssh user@host` instead of `su - user` when a password change is pending |
-| `sudo`: `PAM account management error: Permission denied` | HBAC only allowed the `sshd` service, not `sudo` — sudo itself is gated by HBAC | Add the `sudo` service to the relevant HBAC rule: `ipa hbacrule-add-service <rule> --hbacsvcs=sudo` |
-| `sudo`: "jdoe is not allowed to run sudo on \<host\>" (after HBAC fix) | Sudo rule existed but had no allowed commands or RunAs user attached | `ipa sudorule-add-allow-command` and `ipa sudorule-add-runasuser` |
-| Sudo rule updated on server but client still denies | SSSD caches sudo rules locally and doesn't always pick up changes immediately | `sudo sss_cache -E && sudo systemctl restart sssd` on the client |
-| `su - jdoe` → "Could not chdir to home directory" | `oddjob-mkhomedir` not installed/enabled, so IdM never created a local home directory on the client | Deferred — install `oddjob-mkhomedir`, enable `oddjobd`, run `authselect enable-feature with-mkhomedir` |
+| SSH connection drops mid-install | Sustained CPU load during cert/CA generation on a CPU-credit-limited instance | Run heavy installs (`ipa-server-install`, `ipa-replica-install`) inside `tmux` |
+| `AssertionError: Another instance named 'X-Y' may already exist` | A crashed install left a partial Directory Server instance behind | `dsctl -l` to find it, `dsctl <instance> remove --do-it` to clean up before retrying; after 2+ failed attempts, prefer terminating and relaunching fresh |
+| `ipa-client-install`: `Joining realm failed: JSON-RPC call failed: Timeout` | Port 443 was scoped to home IP only, not the security group | Add a rule opening 443 `--source-group` in addition to the home-IP rule |
+| `ipa-replica-install` connection check fails on port 80 | Port 80 had the same home-IP-only scoping issue as 443 originally did | Open port 80 `--source-group` as well |
+| `--hbacsvcs=a,b` or `--groups=a,b` silently does nothing (0 members added) | Comma-separated values in one flag are read as one literal string, not split | Repeat the flag once per value: `--hbacsvcs=a --hbacsvcs=b` |
+| `su - user` → `Permission denied` on an expired/reset password | `su`'s PAM path doesn't handle "password expired" prompts the way `sshd`'s does | Use `ssh user@host` instead of `su - user` when a password change is pending |
+| `sudo`: `PAM account management error: Permission denied` | HBAC allows `sshd` but not the `sudo` service on that rule | Add the service: `ipa hbacrule-add-service <rule> --hbacsvcs=sudo` |
+| `sudo`: "user is not allowed to run sudo" (after HBAC fix) | Sudo rule has no allowed commands or RunAs user attached | `ipa sudorule-add-allow-command` and `ipa sudorule-add-runasuser` |
+| Sudo/HBAC rule updated on server but client still denies | SSSD caches rules locally | `sudo sss_cache -E && sudo systemctl restart sssd` on the client |
+| `su - user` → "Could not chdir to home directory" | `oddjob-mkhomedir` not installed/enabled | Deferred — install `oddjob-mkhomedir`, enable `oddjobd`, `authselect enable-feature with-mkhomedir` |
+| `ipa-replica-manage list` fails with a DNS error even using `/etc/hosts` | This specific tool insists on real DNS resolution, unlike most `ipa`/Kerberos tooling | Skip the tool; check `/var/log/dirsrv/slapd-*/errors` and `ldapsearch` against `cn=mapping tree,cn=config` directly |
+| Replication: initial sync succeeds, incremental sync fails with a GSSAPI decoding error ("Unable to parse the response to the startReplication extended operation") | Stale GSSAPI/Kerberos session state left over from the promotion process (not clock skew — verified via `chronyc tracking` on both sides first) | Restart Directory Server on both peers: `sudo systemctl restart dirsrv@<REALM>` |
 
 ## Verification Commands
 ```bash
-# Server health
+# Server/replica health
 sudo ipactl status
 kinit admin && klist
 
@@ -59,16 +94,27 @@ kinit admin && klist
 id admin
 
 # HBAC test (no live login needed)
-ipa hbactest --user=jdoe --host=idm-client.lab.local --service=sshd
-ipa hbactest --user=jdoe --host=idm-client.lab.local --service=sudo
+ipa hbactest --user=<user> --host=<host> --service=<sshd|sudo>
 
-# Sudo scoping test (from idm-client, logged in as jdoe)
-sudo systemctl status sshd   # should succeed
-sudo whoami                  # should be denied
+# Nested group inheritance
+ipa user-show <user> --all | grep -i member
+
+# Account lockout status and recovery
+ipa user-status <user>
+ipa user-unlock <user>
+
+# Replication proof
+# On server A:
+ipa user-add repltest --first=Repl --last=Test --password
+# On server B:
+kinit admin
+ipa user-show repltest
 ```
 
 ## Known Gaps / Next Time
 - `oddjob-mkhomedir` never installed — home directories don't auto-create on
-  the client. Fix and document properly on the next repeat of this lab.
-- No integrated DNS was configured (deliberate, to save time) — worth trying
-  a DNS-integrated variant in a future lab for comparison.
+  clients.
+- No integrated DNS configured — worth trying a DNS-integrated variant for
+  comparison in a future lab.
+- CA service only runs on idm-server, not idm-replica (`ipa-ca-install` would
+  add CA redundancy — beyond scope of what was asked for this round).
